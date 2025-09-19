@@ -81,7 +81,7 @@ def find_near_duplicates(rows, threshold=90, prefix_len=20, cap=120):
 # Streamlit App
 # ---------------------------
 st.set_page_config(page_title="News Pattern Check", layout="wide")
-st.title("🧪 News Pattern Self-Check Tool")
+st.title("News Pattern Self-Check Tool")
 st.caption("Upload a CSV (FB/IG exports) → discover repetitive patterns and possible originality risks.")
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
@@ -97,13 +97,13 @@ if uploaded:
     df["_TEXT_RAW"] = df[col_text].astype(str).fillna("").agg(" ".join, axis=1)
     rows = [norm_text(x) for x in df["_TEXT_RAW"].tolist()]
 
-    st.subheader("📊 Top n-grams (frequent phrases)")
+    st.subheader("Top n-grams (frequent phrases)")
     mined = mine_ngrams(rows, n_min=1, n_max=3, min_df=5)
     for n, grams in mined.items():
         st.markdown(f"**{n}-grams**")
         st.dataframe(pd.DataFrame(grams[:30], columns=["ngram", "doc_freq", "total_freq"]))
 
-    st.subheader("🧬 Near-duplicate rows")
+    st.subheader("Near-duplicate rows")
     pairs = find_near_duplicates(rows, threshold=90)
     st.write(f"Found {len(pairs)} near-duplicate pairs")
     if pairs:
@@ -113,7 +113,7 @@ if uploaded:
                            "text_i": df.loc[i, "_TEXT_RAW"], "text_j": df.loc[j, "_TEXT_RAW"]})
         st.dataframe(pd.DataFrame(sample))
 
-    st.subheader("⬇️ Download annotated report")
+    st.subheader("⬇Download annotated report")
     out = io.StringIO()
     pd.DataFrame(rows, columns=["normalized"]).to_csv(out, index=False)
     st.download_button("Download normalized_texts.csv", out.getvalue(), "normalized_texts.csv", "text/csv")

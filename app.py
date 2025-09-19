@@ -105,6 +105,62 @@ def tokenize(text: str, cjk_mode: str = "raw", jieba_mod=None):
     return toks
 
 
+def _is_cjk_string(s: str) -> bool:
+    return len(s) > 0 and all(bool(CJK_RE.match(ch)) for ch in s)
+
+
+# ---------------------------
+# Quality helpers: substring suppression and stitching
+# ---------------------------
+def suppress_substrings(cands):
+    """
+    Suppress shorter substrings when a longer/better phrase exists.
+    cands: list[dict] with keys: phrase, doc_freq, total_freq, score(optional)
+    """
+    cands = sorted(cands, key=lambda x: (-(x.get("score") or 0), -x["doc_freq"], -len(x["phrase"])))
+    keep = []
+    seen = []
+    for item in cands:
+        p = item["phrase"]
+        if any((p in q and p != q) for q in seen):
+            continue
+        keep.append(item)
+        seen.append(p)
+    return keep
+
+
+def stitch_cjk_phrases(cands_by_n):
+    """
+    Stitch common 2/3/4-gram CJK phrases into longer ones by overlapping 1 char.
+    Returns a list[str] of stitched candidates (reference only).
+    """
+    grams2 = {g for g, _, _ in cands_by_n.get(2, []) if _is_cjk_string(g)}
+    grams3 = {g for g, _, _ in cands_by_n.get(3, []) if _is_cjk_string(g)}
+    grams4 = {g for g, _, _ in cands_by_n.get(4, []) if _is_cjk_string(g)}
+    stitched = set()
+
+    def overlap_join(a, b):
+        if len(a) >= 1 and len(b) >= 1 and a[-1] == b[0]:
+            return a + b[1:]
+        return None
+
+    sources = [grams2, grams3, grams4]
+    for _ in range(2):
+        new_set = set()
+        pool = set().union(*sources)
+        for x in pool:
+            for y in pool:
+                if x == y:
+                    continue
+                j = overlap_join(x, y)
+                if j and _is_cjk_string(j) and 2 <= len(j) <= 8:
+                    new_set.add(j)
+        stitched |= new_set
+        sources.append(new_set)
+
+    return sorted(stitched, key=len, reverse=True)
+
+
 # ---------------------------
 # Cached miners
 # ---------------------------
@@ -126,7 +182,6 @@ def mine_ngrams(rows,
 
     Counters are initialized up to max_n_needed to avoid KeyError.
     """
-    # We always build char-level grams for CJK
     max_n_needed = max(n_max, cjk_char_ng_max)
 
     df_counters = {n: Counter() for n in range(n_min, max_n_needed + 1)}
@@ -158,12 +213,36 @@ def mine_ngrams(rows,
                 for g in set(grams):
                     df_counters[n][g] += 1
 
-    # collect results
+    # simple Dice score for n>=2 as a quality signal
+    def dice_for_phrase(p, rows_norm):
+        if _is_cjk_string(p):
+            if len(p) < 2:
+                return 0.0
+            A = sum(1 for r in rows_norm if p[:-1] in r)
+            B = sum(1 for r in rows_norm if p[1:] in r)
+            AB = sum(1 for r in rows_norm if p in r)
+        else:
+            left = p.split(' ')[0]
+            right = p.split(' ')[-1]
+            A = sum(1 for r in rows_norm if (' ' + left + ' ') in (' ' + r + ' '))
+            B = sum(1 for r in rows_norm if (' ' + right + ' ') in (' ' + r + ' '))
+            AB = sum(1 for r in rows_norm if p in r)
+        if A + B == 0:
+            return 0.0
+        return 2 * AB / (A + B)
+
+    # assemble results with quality sorting and substring suppression
     results = {}
+    rows_norm = rows
     for n in range(n_min, max_n_needed + 1):
-        cand = [(g, df, tf_counters[n][g]) for g, df in df_counters[n].items() if df >= min_df]
-        cand = sorted(cand, key=lambda x: (-x[1], -x[2]))[:top_k]
-        results[n] = cand
+        raw = [(g, df, tf_counters[n][g]) for g, df in df_counters[n].items() if df >= min_df]
+        enriched = []
+        for g, dfv, tfv in raw:
+            score = dice_for_phrase(g, rows_norm) if n >= 2 else 0.0
+            enriched.append({"phrase": g, "doc_freq": dfv, "total_freq": tfv, "score": score})
+        enriched = suppress_substrings(enriched)
+        enriched = sorted(enriched, key=lambda x: (-(x["score"] or 0), -x["doc_freq"], -len(x["phrase"])))[:top_k]
+        results[n] = [(e["phrase"], e["doc_freq"], e["total_freq"]) for e in enriched]
     return results
 
 
@@ -221,7 +300,7 @@ enable_jieba = (cjk_mode == "jieba" and _has_jieba())
 # Single essential quality threshold
 min_df = st.sidebar.slider("Min document frequency", 2, 50, 8, 1)
 
-# Near-duplicate scanning: keep on by default, with sane fixed parameters
+# Near-duplicate scanning: keep on by default, with fixed parameters
 enable_dups = st.sidebar.checkbox("Scan near-duplicate rows", value=True)
 
 # ---------------------------
@@ -270,15 +349,12 @@ with st.spinner("Mining n-grams..."):
         min_df=min_df,
         cjk_mode=cjk_mode,
         cjk_char_ng_min=2,
-        cjk_char_ng_max=ngrams_max,  # align with max n
+        cjk_char_ng_max=max(ngrams_max, 6),  # allow longer CJK phrases up to 6 characters
         top_k=top_k,
         jieba_enabled=enable_jieba,
     )
 
-def _is_cjk_string(s: str) -> bool:
-    return len(s) > 0 and all(bool(CJK_RE.match(ch)) for ch in s)
-
-# Display 4 -> 3 -> 2 -> 1
+# Display 4 -> 3 -> 2 -> 1 (or according to slider)
 ordered_ns = list(range(1, max(ngrams_max, 1) + 1))[::-1]
 cols = st.columns(min(3, len(ordered_ns)))
 for idx, n in enumerate(ordered_ns):
@@ -292,6 +368,12 @@ for idx, n in enumerate(ordered_ns):
     with cols[idx % len(cols)]:
         st.markdown(f"{n}-grams")
         st.dataframe(df_show, use_container_width=True)
+
+# Stitched CJK phrases as reference
+st.markdown("CJK stitched phrases (reference)")
+stitched = stitch_cjk_phrases({n: mined.get(n, []) for n in (2, 3, 4)})
+df_stitched = pd.DataFrame({"phrase": stitched[:50]})
+st.dataframe(df_stitched, use_container_width=True)
 
 # Near-duplicate clusters (optional)
 st.subheader("Near-duplicate rows")
@@ -311,9 +393,9 @@ if enable_dups:
 else:
     st.info("Duplicate scan is turned off.")
 
-# Keyword quick check (kept for practical debugging)
+# Keyword quick check
 st.subheader("Keyword quick check")
-kw = st.text_input("Enter keyword (e.g., 自爆, 自嘲)")
+kw = st.text_input("Enter keyword (e.g., 美寶, 真美)")
 if kw:
     hits = df[df["_TEXT_RAW"].astype(str).str.contains(kw, na=False)]
     st.write(f"Rows containing '{kw}': {len(hits)}")

@@ -93,9 +93,15 @@ if uploaded:
         st.error("No text columns found")
         st.stop()
 
-    col_text = st.multiselect("Select text columns", text_cols, default=text_cols[:2])
-    df["_TEXT_RAW"] = df[col_text].astype(str).fillna("").agg(" ".join, axis=1)
-    rows = [norm_text(x) for x in df["_TEXT_RAW"].tolist()]
+col_text = st.multiselect("Select text columns", text_cols, default=[])
+
+if not col_text:
+    st.warning("請先選擇至少一個欄位再繼續分析")
+    st.stop()
+
+df["_TEXT_RAW"] = df[col_text].astype(str).fillna("").agg(" ".join, axis=1)
+rows = [norm_text(x) for x in df["_TEXT_RAW"].tolist()]
+
 
     st.subheader("Top n-grams (frequent phrases)")
     mined = mine_ngrams(rows, n_min=1, n_max=3, min_df=5)

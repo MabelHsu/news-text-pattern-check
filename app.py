@@ -82,12 +82,12 @@ def try_import_jieba():
         return None
 
 
-def tokenize(text: str, cjk_mode: str = "char-ngrams", jieba_mod=None):
+def tokenize(text: str, cjk_mode: str = "raw", jieba_mod=None):
     """
     cjk_mode:
-      - "char-ngrams": return single CJK characters here; char n-grams are built later
+      - "raw": keep each CJK run as one token (default)
       - "jieba": use jieba.lcut if available
-      - "raw": keep each CJK run as one token (no character splitting)
+      - "char-ngrams": return single CJK characters here; char n-grams are built later
     """
     toks = []
     for is_cjk, seg in split_runs(text):
@@ -111,25 +111,23 @@ def tokenize(text: str, cjk_mode: str = "char-ngrams", jieba_mod=None):
 @st.cache_data(show_spinner=False)
 def mine_ngrams(rows,
                 n_min=1,
-                n_max=3,
-                min_df=5,
-                cjk_mode="char-ngrams",
+                n_max=4,
+                min_df=8,
+                cjk_mode="raw",
                 cjk_char_ng_min=2,
-                cjk_char_ng_max=3,
-                force_cjk_char_ngrams=False,
-                top_k=100,
+                cjk_char_ng_max=4,
+                top_k=500,
                 jieba_enabled=False):
     """
     Mine n-grams by document frequency and total frequency.
 
-    Counters are initialized up to max_n_needed to avoid KeyError when
-    CJK char n-gram max exceeds token-level n_max.
+    Always adds CJK character-level n-grams (2..cjk_char_ng_max) from CJK runs,
+    so that short terms like 自爆/自嘲 appear even in raw/jieba modes.
 
-    If cjk_mode == "char-ngrams" OR force_cjk_char_ngrams is True,
-    character-level n-grams (2..cjk_char_ng_max) will be added from CJK runs.
+    Counters are initialized up to max_n_needed to avoid KeyError.
     """
-    need_char_ngrams = (cjk_mode == "char-ngrams") or force_cjk_char_ngrams
-    max_n_needed = max(n_max, (cjk_char_ng_max if need_char_ngrams else n_max))
+    # We always build char-level grams for CJK
+    max_n_needed = max(n_max, cjk_char_ng_max)
 
     df_counters = {n: Counter() for n in range(n_min, max_n_needed + 1)}
     tf_counters = {n: Counter() for n in range(n_min, max_n_needed + 1)}
@@ -139,7 +137,7 @@ def mine_ngrams(rows,
     for r in rows:
         toks = tokenize(r, cjk_mode=cjk_mode, jieba_mod=jieba_mod)
 
-        # token-level grams (non-CJK and what tokenize returns)
+        # token-level grams
         for n in range(n_min, n_max + 1):
             if len(toks) >= n:
                 grams = [' '.join(toks[i:i + n]) for i in range(len(toks) - n + 1)]
@@ -148,18 +146,17 @@ def mine_ngrams(rows,
                 for g in set(grams):
                     df_counters[n][g] += 1
 
-        # optional character-level CJK grams
-        if need_char_ngrams:
-            for is_cjk, seg in split_runs(r):
-                if not is_cjk:
+        # character-level CJK grams (always on)
+        for is_cjk, seg in split_runs(r):
+            if not is_cjk:
+                continue
+            for n in range(max(2, cjk_char_ng_min), max(2, cjk_char_ng_max) + 1):
+                grams = cjk_char_ngrams(seg, n_min=n, n_max=n)
+                if not grams:
                     continue
-                for n in range(max(2, cjk_char_ng_min), max(2, cjk_char_ng_max) + 1):
-                    grams = cjk_char_ngrams(seg, n_min=n, n_max=n)
-                    if not grams:
-                        continue
-                    tf_counters[n].update(grams)
-                    for g in set(grams):
-                        df_counters[n][g] += 1
+                tf_counters[n].update(grams)
+                for g in set(grams):
+                    df_counters[n][g] += 1
 
     # collect results
     results = {}
@@ -171,7 +168,7 @@ def mine_ngrams(rows,
 
 
 @st.cache_data(show_spinner=False)
-def find_near_duplicates(rows, threshold=90, prefix_len=20, cap=120):
+def find_near_duplicates(rows, threshold=92, prefix_len=24, cap=120):
     """Lightweight fuzzy duplicate detection with blocking."""
     buckets = defaultdict(list)
     for i, t in enumerate(rows):
@@ -191,10 +188,17 @@ def find_near_duplicates(rows, threshold=90, prefix_len=20, cap=120):
 
 
 # ---------------------------
-# Sidebar controls (friendly defaults)
+# Sidebar controls (minimal)
 # ---------------------------
 st.sidebar.header("Settings")
 
+# Max n-gram size: default 4, allowed 2..5
+ngrams_max = st.sidebar.slider("Max n-gram size", 2, 5, 4, 1)
+
+# Show top-K: default to max value (500)
+top_k = st.sidebar.slider("Show top-K phrases per n", 50, 500, 500, 10)
+
+# CJK tokenization mode: default raw
 def _has_jieba():
     try:
         import jieba  # noqa: F401
@@ -202,48 +206,31 @@ def _has_jieba():
     except Exception:
         return False
 
-ngrams_max = st.sidebar.selectbox("Max n-gram size", [1, 2, 3, 4, 5], index=2)  # default 3
-min_df = st.sidebar.slider("Min document frequency (phrase must appear in at least this many rows)", 2, 50, 12, 1)
-top_k = st.sidebar.slider("Show top-K phrases per n", 20, 300, 60, 10)
-
-# Three CJK modes: char-ngrams, jieba, raw
-_default_cjk_index = 1 if _has_jieba() else 0
 cjk_mode = st.sidebar.selectbox(
     "CJK tokenization mode",
-    ["char-ngrams", "jieba", "raw"],
-    index=_default_cjk_index,
+    ["raw", "jieba", "char-ngrams"],
+    index=0,
     help=(
-        "char-ngrams: split CJK into characters then build 2–3 char n-grams; "
-        "jieba: use Chinese word segmentation (needs package); "
-        "raw: keep each CJK run as a whole, without splitting."
+        "raw: keep each CJK run as a whole; "
+        "jieba: Chinese word segmentation (needs package); "
+        "char-ngrams: split CJK into characters (n-grams built in miner)."
     )
 )
+enable_jieba = (cjk_mode == "jieba" and _has_jieba())
 
-# In jieba or raw mode, you can still add CJK char n-grams to surface short terms
-force_cjk_char_ngrams = st.sidebar.checkbox(
-    "Also build CJK char n-grams (useful in jieba/raw)",
-    value=(cjk_mode in ["jieba", "raw"])
-)
+# Single essential quality threshold
+min_df = st.sidebar.slider("Min document frequency", 2, 50, 8, 1)
 
-# For char-level n-grams, default to 2–3 characters to avoid over-fragmentation
-cjk_char_ng_min = st.sidebar.slider("CJK character n-gram min", 2, 4, 2, 1)
-cjk_char_ng_max = st.sidebar.slider("CJK character n-gram max", 2, 6, 3, 1)
-
-dup_threshold = st.sidebar.slider("Near-duplicate similarity threshold (token_set_ratio ≥)", 70, 100, 92, 1)
-prefix_len = st.sidebar.slider("Duplicate blocking prefix length", 10, 60, 24, 2)
-pairs_cap = st.sidebar.slider("Max comparisons per bucket (cap)", 50, 400, 100, 10)
-
-hide_single_cjk_unigram = st.sidebar.checkbox("Hide single-character CJK unigrams in tables", value=True)
-
-enable_jieba = st.sidebar.checkbox(
-    "Enable jieba (requires package installed)",
-    value=(cjk_mode == "jieba" and _has_jieba())
-)
+# Near-duplicate scanning: keep on by default, with sane fixed parameters
+enable_dups = st.sidebar.checkbox("Scan near-duplicate rows", value=True)
 
 # ---------------------------
 # File upload
 # ---------------------------
-uploaded = st.file_uploader("Upload CSV (UTF-8). Include columns like Title, Description, Caption, Text.", type=["csv"])
+uploaded = st.file_uploader(
+    "Upload CSV (UTF-8). Include columns like Title, Description, Caption, Text.",
+    type=["csv"]
+)
 
 if not uploaded:
     st.info("Upload a CSV to begin.")
@@ -254,7 +241,12 @@ df = pd.read_csv(uploaded)
 # Choose text columns
 text_cols_all = [c for c in df.columns if df[c].dtype == object or str(df[c].dtype).startswith("string")]
 default_cols = [c for c in text_cols_all if c.lower() in ("title", "description", "caption", "text", "name")] or text_cols_all[:2]
-col_text = st.multiselect("Select text columns to analyze", options=text_cols_all, default=default_cols, help="Selected columns will be concatenated for analysis.")
+col_text = st.multiselect(
+    "Select text columns to analyze",
+    options=text_cols_all,
+    default=default_cols,
+    help="Selected columns will be concatenated for analysis."
+)
 if not col_text:
     st.warning("Please select at least one text column.")
     st.stop()
@@ -268,8 +260,8 @@ k1, k2 = st.columns(2)
 k1.metric("Rows analyzed", f"{len(rows)}")
 k2.metric("Selected columns", f"{', '.join(col_text)}")
 
-# N-gram mining
-st.subheader("Top n-grams")
+# N-gram mining (always add CJK char n-grams 2..ngrams_max for CJK segments)
+st.subheader("Top n-grams (largest n first)")
 with st.spinner("Mining n-grams..."):
     mined = mine_ngrams(
         rows,
@@ -277,22 +269,23 @@ with st.spinner("Mining n-grams..."):
         n_max=ngrams_max,
         min_df=min_df,
         cjk_mode=cjk_mode,
-        cjk_char_ng_min=cjk_char_ng_min,
-        cjk_char_ng_max=cjk_char_ng_max,
-        force_cjk_char_ngrams=force_cjk_char_ngrams,
+        cjk_char_ng_min=2,
+        cjk_char_ng_max=ngrams_max,  # align with max n
         top_k=top_k,
         jieba_enabled=enable_jieba,
     )
 
 def _is_cjk_string(s: str) -> bool:
-    return all(bool(CJK_RE.match(ch)) for ch in s)
+    return len(s) > 0 and all(bool(CJK_RE.match(ch)) for ch in s)
 
-cols = st.columns(min(3, ngrams_max))
-for idx, n in enumerate(range(1, ngrams_max + 1)):
+# Display 4 -> 3 -> 2 -> 1
+ordered_ns = list(range(1, max(ngrams_max, 1) + 1))[::-1]
+cols = st.columns(min(3, len(ordered_ns)))
+for idx, n in enumerate(ordered_ns):
     df_show = pd.DataFrame(mined.get(n, []), columns=["ngram", "doc_freq", "total_freq"])
 
-    # Hide single-character CJK unigrams if checked
-    if n == 1 and hide_single_cjk_unigram and not df_show.empty:
+    # hide single-character CJK unigram by default
+    if n == 1 and not df_show.empty:
         mask = ~df_show["ngram"].map(lambda x: len(x) == 1 and _is_cjk_string(x))
         df_show = df_show[mask]
 
@@ -300,22 +293,25 @@ for idx, n in enumerate(range(1, ngrams_max + 1)):
         st.markdown(f"{n}-grams")
         st.dataframe(df_show, use_container_width=True)
 
-# Near-duplicate clusters
+# Near-duplicate clusters (optional)
 st.subheader("Near-duplicate rows")
-with st.spinner("Scanning for near-duplicates..."):
-    pairs = find_near_duplicates(rows, threshold=dup_threshold, prefix_len=prefix_len, cap=pairs_cap)
-st.write(f"Pairs found: {len(pairs)}")
-if pairs:
-    sample = []
-    for (i, j, s) in pairs[:200]:
-        sample.append({
-            "row_i": i, "row_j": j, "similarity": s,
-            "text_i": df.loc[i, "_TEXT_RAW"],
-            "text_j": df.loc[j, "_TEXT_RAW"],
-        })
-    st.dataframe(pd.DataFrame(sample), use_container_width=True)
+if enable_dups:
+    with st.spinner("Scanning for near-duplicates..."):
+        pairs = find_near_duplicates(rows, threshold=92, prefix_len=24, cap=120)
+    st.write(f"Pairs found: {len(pairs)}")
+    if pairs:
+        sample = []
+        for (i, j, s) in pairs[:200]:
+            sample.append({
+                "row_i": i, "row_j": j, "similarity": s,
+                "text_i": df.loc[i, "_TEXT_RAW"],
+                "text_j": df.loc[j, "_TEXT_RAW"],
+            })
+        st.dataframe(pd.DataFrame(sample), use_container_width=True)
+else:
+    st.info("Duplicate scan is turned off.")
 
-# Keyword quick check
+# Keyword quick check (kept for practical debugging)
 st.subheader("Keyword quick check")
 kw = st.text_input("Enter keyword (e.g., 自爆, 自嘲)")
 if kw:

@@ -29,35 +29,36 @@ STOP_TOKENS = set("""
 
 
 def is_noise(ng):
-    if ng.isdigit(): return True
-    if ng in STOP_TOKENS: return True
-    if len(ng) == 1 and not CJK_RE.match(ng): return True
+    if ng.isdigit():
+        return True
+    if ng in STOP_TOKENS:
+        return True
+    if len(ng) == 1 and not CJK_RE.match(ng):
+        return True
     return False
 
 
 def mine_ngrams(rows, n_min=1, n_max=5, min_df=5):
-    df_counters = {n:Counter() for n in range(n_min, n_max+1)}
-    tf_counters = {n:Counter() for n in range(n_min, n_max+1)}
+    df_counters = {n: Counter() for n in range(n_min, n_max + 1)}
+    tf_counters = {n: Counter() for n in range(n_min, n_max + 1)}
     for r in rows:
         toks = [t for t in tokenize(r)]
-        for n in range(n_min, n_max+1):
-            if len(toks) < n: continue
-            seen = set()
-            grams = [' '.join(toks[i:i+n]) for i in range(len(toks)-n+1)]
+        for n in range(n_min, n_max + 1):
+            if len(toks) < n:
+                continue
+            grams = [' '.join(toks[i:i + n]) for i in range(len(toks) - n + 1)]
             tf_counters[n].update(grams)
             for g in set(grams):
-                seen.add(g)
-            for g in seen:
                 df_counters[n][g] += 1
     results = {}
-    for n in range(n_min, n_max+1):
+    for n in range(n_min, n_max + 1):
         cand = []
-        for g, df in df_counters[n].items():
-            if df >= min_df:
-                if any(is_noise(tok) for tok in g.split()): 
+        for g, df_val in df_counters[n].items():
+            if df_val >= min_df:
+                if any(is_noise(tok) for tok in g.split()):
                     continue
-                cand.append((g, df, tf_counters[n][g]))
-        results[n] = sorted(cand, key=lambda x:(-x[1], -x[2]))
+                cand.append((g, df_val, tf_counters[n][g]))
+        results[n] = sorted(cand, key=lambda x: (-x[1], -x[2]))
     return results
 
 
@@ -67,9 +68,10 @@ def find_near_duplicates(rows, threshold=90, prefix_len=20, cap=120):
         buckets[t[:prefix_len]].append((i, t))
     pairs = []
     for items in buckets.values():
-        if len(items) > cap: items = items[:cap]
+        if len(items) > cap:
+            items = items[:cap]
         for i in range(len(items)):
-            for j in range(i+1, len(items)):
+            for j in range(i + 1, len(items)):
                 ii, a = items[i]
                 jj, b = items[j]
                 s = fuzz.token_set_ratio(a, b)
@@ -77,52 +79,73 @@ def find_near_duplicates(rows, threshold=90, prefix_len=20, cap=120):
                     pairs.append((ii, jj, s))
     return pairs
 
+
 # ---------------------------
 # Streamlit App
 # ---------------------------
 st.set_page_config(page_title="News Pattern Check", layout="wide")
 st.title("News Pattern Self-Check Tool")
-st.caption("Upload a CSV (FB/IG exports) → discover repetitive patterns and possible originality risks.")
+st.caption("Upload a CSV (FB/IG exports) to discover repetitive phrases and possible originality risks.")
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
-if uploaded:
-    df = pd.read_csv(uploaded)
-    text_cols = [c for c in df.columns if df[c].dtype == object or str(df[c].dtype).startswith("string")]
-    if not text_cols:
-        st.error("No text columns found")
-        st.stop()
+if uploaded is None:
+    st.info("請先上傳 CSV 檔（建議包含 Title / Description / Caption 欄位）")
+    st.stop()
 
+# 讀檔：嘗試處理 UTF-8 與 UTF-8-SIG
+try:
+    df = pd.read_csv(uploaded)
+except UnicodeDecodeError:
+    uploaded.seek(0)
+    df = pd.read_csv(uploaded, encoding="utf-8-sig")
+
+text_cols = [c for c in df.columns if df[c].dtype == object or str(df[c].dtype).startswith("string")]
+if not text_cols:
+    st.error("在此 CSV 中找不到文字型欄位。請確認有 Title / Description / Caption 等欄位。")
+    st.stop()
+
+st.write("Detected columns:", ", ".join(df.columns.astype(str)))
+
+# 讓用戶自行選欄位（預設不選）
 col_text = st.multiselect("Select text columns", text_cols, default=[])
 
 if not col_text:
-    st.warning("請先選擇至少一個欄位再繼續分析")
+    st.warning("請先選擇至少一個欄位再繼續分析。")
     st.stop()
 
+# 合併文字欄位並正規化
 df["_TEXT_RAW"] = df[col_text].astype(str).fillna("").agg(" ".join, axis=1)
 rows = [norm_text(x) for x in df["_TEXT_RAW"].tolist()]
 
+# ---- Top n-grams
+st.subheader("Top n-grams (frequent phrases)")
+mined = mine_ngrams(rows, n_min=1, n_max=3, min_df=5)
+for n, grams in mined.items():
+    st.markdown(f"{n}-grams")
+    st.dataframe(pd.DataFrame(grams[:30], columns=["ngram", "doc_freq", "total_freq"]))
 
-    st.subheader("Top n-grams (frequent phrases)")
-    mined = mine_ngrams(rows, n_min=1, n_max=3, min_df=5)
-    for n, grams in mined.items():
-        st.markdown(f"**{n}-grams**")
-        st.dataframe(pd.DataFrame(grams[:30], columns=["ngram", "doc_freq", "total_freq"]))
+# ---- Near-duplicate detector
+st.subheader("Near-duplicate rows")
+pairs = find_near_duplicates(rows, threshold=90)
+st.write(f"Found {len(pairs)} near-duplicate pairs")
+if pairs:
+    sample = []
+    for (i, j, s) in pairs[:100]:
+        sample.append({
+            "i": i,
+            "j": j,
+            "similarity": s,
+            "text_i": df.loc[i, "_TEXT_RAW"],
+            "text_j": df.loc[j, "_TEXT_RAW"]
+        })
+    st.dataframe(pd.DataFrame(sample))
 
-    st.subheader("Near-duplicate rows")
-    pairs = find_near_duplicates(rows, threshold=90)
-    st.write(f"Found {len(pairs)} near-duplicate pairs")
-    if pairs:
-        sample = []
-        for (i,j,s) in pairs[:100]:
-            sample.append({"i": i, "j": j, "similarity": s,
-                           "text_i": df.loc[i, "_TEXT_RAW"], "text_j": df.loc[j, "_TEXT_RAW"]})
-        st.dataframe(pd.DataFrame(sample))
+# ---- Download normalized text
+st.subheader("Download annotated report")
+out = io.StringIO()
+pd.DataFrame({"normalized": rows, "raw": df["_TEXT_RAW"]}).to_csv(out, index=False)
+st.download_button("Download normalized_texts.csv", out.getvalue(), "normalized_texts.csv", "text/csv")
 
-    st.subheader("⬇Download annotated report")
-    out = io.StringIO()
-    pd.DataFrame(rows, columns=["normalized"]).to_csv(out, index=False)
-    st.download_button("Download normalized_texts.csv", out.getvalue(), "normalized_texts.csv", "text/csv")
-
-    st.markdown("---")
-    st.markdown("**Tips:** High-frequency phrases and near-duplicate structures often explain why content looks repetitive to the monetisation system.")
+st.markdown("---")
+st.markdown("Tips: 高頻片語（尤其跨多篇貼文的 doc_freq 高者）與近重複結構，常會讓系統判定為模版式或低原創度。")

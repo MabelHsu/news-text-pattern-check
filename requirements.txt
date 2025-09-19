@@ -2,3 +2,5 @@ streamlit==1.38.0
 pandas>=2.0
 numpy>=1.26
 rapidfuzz>=3.6
+# Optional: uncomment to enable jieba-based Chinese tokenization
+# jieba>=0.42.1

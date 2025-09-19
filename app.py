@@ -1,34 +1,67 @@
-import re
 import io
+import re
+from collections import Counter, defaultdict
+
 import pandas as pd
 import streamlit as st
-from collections import Counter, defaultdict
 from rapidfuzz import fuzz
 
 # ---------------------------
-# Helpers
+# Streamlit page settings
+# ---------------------------
+st.set_page_config(page_title="News Text Pattern Self-Check", layout="wide")
+st.title("News Text Pattern Self-Check")
+st.caption("Upload a CSV and discover repetitive phrases and near-duplicate headlines/descriptions.")
+
+# ---------------------------
+# Language-aware helpers
 # ---------------------------
 CJK_RE = re.compile(r'[\u4e00-\u9fff]')
 TOKEN_RE = re.compile(r'[\u4e00-\u9fffA-Za-z0-9_]+')
 
-
 def norm_text(s: str) -> str:
     if not isinstance(s, str):
         s = "" if s is None else str(s)
+    # Lowercase Latin, keep CJK intact
     s = ''.join([ch.lower() if not CJK_RE.match(ch) else ch for ch in s])
-    return re.sub(r'\s+', ' ', s.strip())
+    # Collapse whitespace
+    s = re.sub(r'\s+', ' ', s.strip())
+    return s
 
+def split_runs(text: str):
+    """Split text into runs of (is_cjk, segment)."""
+    runs = []
+    if not text:
+        return runs
+    cur_is_cjk = bool(CJK_RE.match(text[0]))
+    buf = []
+    for ch in text:
+        is_cjk = bool(CJK_RE.match(ch))
+        if is_cjk == cur_is_cjk:
+            buf.append(ch)
+        else:
+            runs.append((cur_is_cjk, ''.join(buf)))
+            buf = [ch]
+            cur_is_cjk = is_cjk
+    if buf:
+        runs.append((cur_is_cjk, ''.join(buf)))
+    return runs
 
-def tokenize(text: str):
-    return TOKEN_RE.findall(text)
-
+def cjk_char_ngrams(seg: str, n_min=2, n_max=4):
+    grams = []
+    L = len(seg)
+    for n in range(n_min, n_max + 1):
+        if L < n:
+            continue
+        for i in range(L - n + 1):
+            grams.append(seg[i:i+n])
+    return grams
 
 STOP_TOKENS = set("""
 的 了 在 是 和 與 地 得 也 及 並 或 你 我 他 她 它 我們 你們 他們 這 那 the a an and or of to in for on with is are was were be been at by from
 """.split())
 
-
-def is_noise(ng):
+def is_noise(ng: str) -> bool:
     if ng.isdigit():
         return True
     if ng in STOP_TOKENS:
@@ -37,32 +70,87 @@ def is_noise(ng):
         return True
     return False
 
+# Optional: jieba support (only if installed)
+def try_import_jieba():
+    try:
+        import jieba  # type: ignore
+        return jieba
+    except Exception:
+        return None
 
-def mine_ngrams(rows, n_min=1, n_max=5, min_df=5):
+def tokenize(text: str, cjk_mode: str = "char-ngrams", jieba_mod=None):
+    """
+    Tokenize mixed CJK/Latin text.
+    cjk_mode:
+      - "char-ngrams": return single CJK characters here; n-grams built later in mine_ngrams
+      - "jieba": use jieba.lcut if available
+      - "raw": keep each CJK run as a single token (not recommended)
+    """
+    toks = []
+    for is_cjk, seg in split_runs(text):
+        if not seg.strip():
+            continue
+        if is_cjk:
+            if cjk_mode == "jieba" and jieba_mod is not None:
+                toks.extend([w for w in jieba_mod.lcut(seg) if w.strip()])
+            elif cjk_mode == "char-ngrams":
+                # return single characters; character n-grams added in mine_ngrams
+                toks.extend(list(seg))
+            else:
+                toks.append(seg)  # raw CJK runs as one token (not recommended)
+        else:
+            toks.extend(TOKEN_RE.findall(seg))
+    return toks
+
+# ---------------------------
+# Cached miners
+# ---------------------------
+@st.cache_data(show_spinner=False)
+def mine_ngrams(rows, n_min=1, n_max=3, min_df=5, cjk_mode="char-ngrams", cjk_char_ng_min=2, cjk_char_ng_max=4, top_k=100, jieba_enabled=False):
+    """
+    Mine n-grams by document frequency and total frequency.
+    - Non-CJK: build n-grams over tokens.
+    - CJK: always add character-level n-grams (2..4 by default) directly from CJK runs.
+    """
     df_counters = {n: Counter() for n in range(n_min, n_max + 1)}
     tf_counters = {n: Counter() for n in range(n_min, n_max + 1)}
+
+    jieba_mod = try_import_jieba() if (cjk_mode == "jieba" and jieba_enabled) else None
+
     for r in rows:
-        toks = [t for t in tokenize(r)]
+        toks = tokenize(r, cjk_mode=cjk_mode, jieba_mod=jieba_mod)
+
+        # Non-CJK and token-level grams
         for n in range(n_min, n_max + 1):
-            if len(toks) < n:
+            if len(toks) >= n:
+                grams = [' '.join(toks[i:i+n]) for i in range(len(toks) - n + 1)]
+                grams = [g for g in grams if not any(is_noise(tok) for tok in g.split())]
+                tf_counters[n].update(grams)
+                for g in set(grams):
+                    df_counters[n][g] += 1
+
+        # Add character-level n-grams for CJK runs
+        for is_cjk, seg in split_runs(r):
+            if not is_cjk:
                 continue
-            grams = [' '.join(toks[i:i + n]) for i in range(len(toks) - n + 1)]
-            tf_counters[n].update(grams)
-            for g in set(grams):
-                df_counters[n][g] += 1
+            for n in range(max(2, cjk_char_ng_min), max(2, cjk_char_ng_max) + 1):
+                grams = cjk_char_ngrams(seg, n_min=n, n_max=n)
+                if not grams:
+                    continue
+                tf_counters[n].update(grams)
+                for g in set(grams):
+                    df_counters[n][g] += 1
+
     results = {}
     for n in range(n_min, n_max + 1):
-        cand = []
-        for g, df_val in df_counters[n].items():
-            if df_val >= min_df:
-                if any(is_noise(tok) for tok in g.split()):
-                    continue
-                cand.append((g, df_val, tf_counters[n][g]))
-        results[n] = sorted(cand, key=lambda x: (-x[1], -x[2]))
+        cand = [(g, df, tf_counters[n][g]) for g, df in df_counters[n].items() if df >= min_df]
+        cand = sorted(cand, key=lambda x: (-x[1], -x[2]))[:top_k]
+        results[n] = cand
     return results
 
-
+@st.cache_data(show_spinner=False)
 def find_near_duplicates(rows, threshold=90, prefix_len=20, cap=120):
+    """Lightweight fuzzy duplicate detection with blocking."""
     buckets = defaultdict(list)
     for i, t in enumerate(rows):
         buckets[t[:prefix_len]].append((i, t))
@@ -79,73 +167,110 @@ def find_near_duplicates(rows, threshold=90, prefix_len=20, cap=120):
                     pairs.append((ii, jj, s))
     return pairs
 
+# ---------------------------
+# Sidebar controls
+# ---------------------------
+st.sidebar.header("Settings")
+
+ngrams_max = st.sidebar.selectbox("Max n-gram size", [1, 2, 3, 4, 5], index=3)
+min_df = st.sidebar.slider("Min document frequency (phrase must appear in at least this many rows)", 2, 50, 8, 1)
+top_k = st.sidebar.slider("Show top-K phrases per n", 20, 300, 100, 10)
+
+cjk_mode = st.sidebar.selectbox("CJK tokenization mode", ["char-ngrams", "jieba", "raw"], index=0)
+cjk_char_ng_min = st.sidebar.slider("CJK character n-gram min", 2, 4, 2, 1)
+cjk_char_ng_max = st.sidebar.slider("CJK character n-gram max", 2, 6, 4, 1)
+enable_jieba = st.sidebar.checkbox("Enable jieba (requires package installed)", value=False)
+
+dup_threshold = st.sidebar.slider("Near-duplicate similarity threshold (token_set_ratio ≥)", 70, 100, 90, 1)
+prefix_len = st.sidebar.slider("Duplicate blocking prefix length", 10, 60, 20, 2)
+pairs_cap = st.sidebar.slider("Max comparisons per bucket (cap)", 50, 400, 120, 10)
 
 # ---------------------------
-# Streamlit App
+# File upload
 # ---------------------------
-st.set_page_config(page_title="News Pattern Check", layout="wide")
-st.title("News Pattern Self-Check Tool")
-st.caption("Upload a CSV (FB/IG exports) to discover repetitive phrases and possible originality risks.")
+uploaded = st.file_uploader("Upload CSV (UTF-8). Include columns like Title, Description, Caption, Text.", type=["csv"])
 
-uploaded = st.file_uploader("Upload CSV", type=["csv"])
-
-if uploaded is None:
-    st.info("請先上傳 CSV 檔（建議包含 Title / Description / Caption 欄位）")
+if not uploaded:
+    st.info("Upload a CSV to begin.")
     st.stop()
 
-# 讀檔：嘗試處理 UTF-8 與 UTF-8-SIG
-try:
-    df = pd.read_csv(uploaded)
-except UnicodeDecodeError:
-    uploaded.seek(0)
-    df = pd.read_csv(uploaded, encoding="utf-8-sig")
+df = pd.read_csv(uploaded)
 
-text_cols = [c for c in df.columns if df[c].dtype == object or str(df[c].dtype).startswith("string")]
-if not text_cols:
-    st.error("在此 CSV 中找不到文字型欄位。請確認有 Title / Description / Caption 等欄位。")
-    st.stop()
-
-st.write("Detected columns:", ", ".join(df.columns.astype(str)))
-
-# 讓用戶自行選欄位（預設不選）
-col_text = st.multiselect("Select text columns", text_cols, default=[])
-
+# Choose text columns
+text_cols_all = [c for c in df.columns if df[c].dtype == object or str(df[c].dtype).startswith("string")]
+default_cols = [c for c in text_cols_all if c.lower() in ("title", "description", "caption", "text", "name")] or text_cols_all[:2]
+col_text = st.multiselect("Select text columns to analyze", options=text_cols_all, default=default_cols, help="Selected columns will be concatenated for analysis.")
 if not col_text:
-    st.warning("請先選擇至少一個欄位再繼續分析。")
+    st.warning("Please select at least one text column.")
     st.stop()
 
-# 合併文字欄位並正規化
+# Build merged text
 df["_TEXT_RAW"] = df[col_text].astype(str).fillna("").agg(" ".join, axis=1)
 rows = [norm_text(x) for x in df["_TEXT_RAW"].tolist()]
 
-# ---- Top n-grams
-st.subheader("Top n-grams (frequent phrases)")
-mined = mine_ngrams(rows, n_min=1, n_max=3, min_df=5)
-for n, grams in mined.items():
-    st.markdown(f"{n}-grams")
-    st.dataframe(pd.DataFrame(grams[:30], columns=["ngram", "doc_freq", "total_freq"]))
+# KPIs
+k1, k2 = st.columns(2)
+k1.metric("Rows analyzed", f"{len(rows)}")
+k2.metric("Selected columns", f"{', '.join(col_text)}")
 
-# ---- Near-duplicate detector
+# N-gram mining
+st.subheader("Top n-grams")
+with st.spinner("Mining n-grams..."):
+    mined = mine_ngrams(
+        rows,
+        n_min=1,
+        n_max=ngrams_max,
+        min_df=min_df,
+        cjk_mode=cjk_mode,
+        cjk_char_ng_min=cjk_char_ng_min,
+        cjk_char_ng_max=cjk_char_ng_max,
+        top_k=top_k,
+        jieba_enabled=enable_jieba,
+    )
+
+cols = st.columns(min(3, ngrams_max))
+for idx, n in enumerate(range(1, ngrams_max + 1)):
+    show = pd.DataFrame(mined.get(n, []), columns=["ngram", "doc_freq", "total_freq"])
+    with cols[idx % len(cols)]:
+        st.markdown(f"{n}-grams")
+        st.dataframe(show, use_container_width=True)
+
+# Near-duplicate clusters
 st.subheader("Near-duplicate rows")
-pairs = find_near_duplicates(rows, threshold=90)
-st.write(f"Found {len(pairs)} near-duplicate pairs")
+with st.spinner("Scanning for near-duplicates..."):
+    pairs = find_near_duplicates(rows, threshold=dup_threshold, prefix_len=prefix_len, cap=pairs_cap)
+st.write(f"Pairs found: {len(pairs)}")
 if pairs:
     sample = []
-    for (i, j, s) in pairs[:100]:
+    for (i, j, s) in pairs[:200]:
         sample.append({
-            "i": i,
-            "j": j,
-            "similarity": s,
+            "row_i": i, "row_j": j, "similarity": s,
             "text_i": df.loc[i, "_TEXT_RAW"],
-            "text_j": df.loc[j, "_TEXT_RAW"]
+            "text_j": df.loc[j, "_TEXT_RAW"],
         })
-    st.dataframe(pd.DataFrame(sample))
+    st.dataframe(pd.DataFrame(sample), use_container_width=True)
 
-# ---- Download normalized text
-st.subheader("Download annotated report")
-out = io.StringIO()
-pd.DataFrame({"normalized": rows, "raw": df["_TEXT_RAW"]}).to_csv(out, index=False)
-st.download_button("Download normalized_texts.csv", out.getvalue(), "normalized_texts.csv", "text/csv")
+# Keyword quick check
+st.subheader("Keyword quick check")
+kw = st.text_input("Enter keyword (e.g., 自爆, 自嘲)")
+if kw:
+    hits = df[df["_TEXT_RAW"].astype(str).str.contains(kw, na=False)]
+    st.write(f"Rows containing '{kw}': {len(hits)}")
+    st.dataframe(hits[col_text + ["_TEXT_RAW"]].head(300), use_container_width=True)
 
-st.markdown("---")
-st.markdown("Tips: 高頻片語（尤其跨多篇貼文的 doc_freq 高者）與近重複結構，常會讓系統判定為模版式或低原創度。")
+# Downloads
+st.subheader("Downloads")
+
+# Normalized texts
+out_norm = io.StringIO()
+pd.DataFrame({"normalized_text": rows}).to_csv(out_norm, index=False)
+st.download_button("Download normalized_texts.csv", out_norm.getvalue(), "normalized_texts.csv", "text/csv")
+
+# Annotated n-grams (flattened)
+annot_rows = []
+for n, grams in mined.items():
+    for g, dfreq, tfreq in grams:
+        annot_rows.append({"n": n, "ngram": g, "doc_freq": dfreq, "total_freq": tfreq})
+out_ngrams = io.StringIO()
+pd.DataFrame(annot_rows).to_csv(out_ngrams, index=False)
+st.download_button("Download ngrams.csv", out_ngrams.getvalue(), "ngrams.csv", "text/csv")

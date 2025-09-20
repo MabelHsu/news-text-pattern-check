@@ -11,7 +11,7 @@ from rapidfuzz import fuzz
 # ---------------------------
 st.set_page_config(page_title="News Text Pattern Self-Check", layout="wide")
 st.title("News Text Pattern Self-Check")
-st.caption("Upload a CSV and discover repetitive phrases and near-duplicate headlines/descriptions.")
+st.caption("Analyze text columns in a CSV to surface frequent phrases and near-duplicate lines.")
 
 # ---------------------------
 # Language-aware helpers
@@ -289,11 +289,7 @@ cjk_mode = st.sidebar.selectbox(
     "CJK tokenization mode",
     ["raw", "jieba", "char-ngrams"],
     index=0,
-    help=(
-        "raw: keep each CJK run as a whole; "
-        "jieba: Chinese word segmentation (needs package); "
-        "char-ngrams: split CJK into characters (n-grams built in miner)."
-    )
+    help="raw keeps whole CJK runs; jieba uses Chinese word segmentation; char-ngrams splits into characters."
 )
 enable_jieba = (cjk_mode == "jieba" and _has_jieba())
 
@@ -304,15 +300,16 @@ min_df = st.sidebar.slider("Min document frequency", 2, 50, 8, 1)
 enable_dups = st.sidebar.checkbox("Scan near-duplicate rows", value=True)
 
 # ---------------------------
-# File upload
+# File upload (concise, no duplicate wording)
 # ---------------------------
 uploaded = st.file_uploader(
-    "Upload CSV (UTF-8). Include columns like Title, Description, Caption, Text.",
-    type=["csv"]
+    "CSV file (UTF-8)",
+    type=["csv"],
+    help="Include text columns such as Title, Description, Caption, Text."
 )
 
 if not uploaded:
-    st.info("Upload a CSV to begin.")
+    # Keep empty state minimal; no extra repeated message
     st.stop()
 
 df = pd.read_csv(uploaded)
@@ -321,7 +318,7 @@ df = pd.read_csv(uploaded)
 text_cols_all = [c for c in df.columns if df[c].dtype == object or str(df[c].dtype).startswith("string")]
 default_cols = [c for c in text_cols_all if c.lower() in ("title", "description", "caption", "text", "name")] or text_cols_all[:2]
 col_text = st.multiselect(
-    "Select text columns to analyze",
+    "Select text columns",
     options=text_cols_all,
     default=default_cols,
     help="Selected columns will be concatenated for analysis."
@@ -354,7 +351,7 @@ with st.spinner("Mining n-grams..."):
         jieba_enabled=enable_jieba,
     )
 
-# Display 4 -> 3 -> 2 -> 1 (or according to slider)
+# Display n in descending order
 ordered_ns = list(range(1, max(ngrams_max, 1) + 1))[::-1]
 cols = st.columns(min(3, len(ordered_ns)))
 for idx, n in enumerate(ordered_ns):
@@ -395,7 +392,7 @@ else:
 
 # Keyword quick check
 st.subheader("Keyword quick check")
-kw = st.text_input("Enter keyword (e.g., 美寶, 真美)")
+kw = st.text_input("Enter keyword (e.g., 自爆, 自嘲)")
 if kw:
     hits = df[df["_TEXT_RAW"].astype(str).str.contains(kw, na=False)]
     st.write(f"Rows containing '{kw}': {len(hits)}")
@@ -407,7 +404,7 @@ st.subheader("Downloads")
 # Normalized texts
 out_norm = io.StringIO()
 pd.DataFrame({"normalized_text": rows}).to_csv(out_norm, index=False)
-st.download_button("Download normalized_texts.csv", out_norm.getvalue(), "normalized_texts.csv", "text/csv")
+st.download_button("normalized_texts.csv", out_norm.getvalue(), "normalized_texts.csv", "text/csv")
 
 # Annotated n-grams (flattened)
 annot_rows = []
@@ -416,4 +413,4 @@ for n, grams in mined.items():
         annot_rows.append({"n": n, "ngram": g, "doc_freq": dfreq, "total_freq": tfreq})
 out_ngrams = io.StringIO()
 pd.DataFrame(annot_rows).to_csv(out_ngrams, index=False)
-st.download_button("Download ngrams.csv", out_ngrams.getvalue(), "ngrams.csv", "text/csv")
+st.download_button("ngrams.csv", out_ngrams.getvalue(), "ngrams.csv", "text/csv")

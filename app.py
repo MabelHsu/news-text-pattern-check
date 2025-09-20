@@ -392,7 +392,7 @@ else:
 
 # Keyword quick check
 st.subheader("Keyword quick check")
-kw = st.text_input("Enter keyword (e.g., 自爆, 自嘲)")
+kw = st.text_input("Enter keyword (e.g., 美寶, 真美)")
 if kw:
     hits = df[df["_TEXT_RAW"].astype(str).str.contains(kw, na=False)]
     st.write(f"Rows containing '{kw}': {len(hits)}")
